@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-import numpy as np
-import io
+import requests
+from io import BytesIO
 
 # Configuración de la página
 st.set_page_config(
@@ -14,12 +14,6 @@ st.set_page_config(
 # CSS personalizado
 st.markdown("""
 <style>
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 20px;
-        border-radius: 10px;
-        color: white;
-    }
     .stMetric {
         background-color: white;
         padding: 15px;
@@ -29,58 +23,71 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Función para cargar datos con múltiples motores
+# Función para convertir link de SharePoint/OneDrive
+def convertir_link_sharepoint(url):
+    """Convierte links de SharePoint/OneDrive a formato descargable"""
+    try:
+        # Si ya tiene download=1, corregir formato
+        if 'download=1' in url:
+            url = url.replace('?download=1', '&download=1')
+        
+        # Si es SharePoint y no tiene download
+        if 'sharepoint.com' in url and 'download=' not in url:
+            if '?' in url:
+                url = url.split('?')[0] + '?download=1'
+            else:
+                url = url + '?download=1'
+        
+        # Si es OneDrive
+        if '1drv.ms' in url or 'onedrive.live.com' in url:
+            if 'download=' not in url:
+                url = url.replace('?', '?download=1&') if '?' in url else url + '?download=1'
+        
+        return url
+    except:
+        return url
+
+# Función para cargar datos
 @st.cache_data(ttl=60)
 def cargar_datos_excel(archivo):
-    """
-    Carga datos desde Excel probando diferentes motores
-    """
     try:
-        # Intentar con openpyxl primero (más común)
         df = pd.read_excel(archivo, engine='openpyxl')
-        return df, "openpyxl"
-    except Exception as e1:
-        try:
-            # Intentar con xlrd para archivos .xls antiguos
-            df = pd.read_excel(archivo, engine='xlrd')
-            return df, "xlrd"
-        except Exception as e2:
-            try:
-                # Último intento sin especificar motor
-                df = pd.read_excel(archivo)
-                return df, "default"
-            except Exception as e3:
-                st.error(f"❌ Error al cargar Excel:")
-                st.error(f"Intento 1 (openpyxl): {str(e1)[:200]}")
-                st.error(f"Intento 2 (xlrd): {str(e2)[:200]}")
-                st.error(f"Intento 3 (default): {str(e3)[:200]}")
-                return None, None
+        return df, None
+    except Exception as e:
+        return None, str(e)
 
 # Función para cargar desde URL
 @st.cache_data(ttl=60)
 def cargar_desde_url(url):
-    """
-    Carga datos desde URL con manejo de errores
-    """
     try:
         import requests
         
-        # Convertir link de OneDrive si es necesario
-        if '1drv.ms' in url or 'onedrive.live.com' in url:
-            if 'download=1' not in url:
-                url = url.replace('?', '?download=1&') if '?' in url else url + '?download=1'
+        # Convertir link
+        url = convertir_link_sharepoint(url)
         
-        response = requests.get(url, timeout=30)
+        st.info(f"🔗 Intentando descargar desde: {url[:100]}...")
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
         response.raise_for_status()
         
-        # Intentar leer como Excel
-        df = pd.read_excel(io.BytesIO(response.content), engine='openpyxl')
-        return df
+        # Verificar si es Excel
+        content_type = response.headers.get('content-type', '')
+        if 'html' in content_type:
+            return None, "El link no apunta a un archivo Excel. Verifica que sea público y termine en .xlsx"
         
+        # Intentar leer como Excel
+        from io import BytesIO
+        df = pd.read_excel(BytesIO(response.content), engine='openpyxl')
+        return df, None
+        
+    except requests.exceptions.RequestException as e:
+        return None, f"Error de conexión: {str(e)}"
     except Exception as e:
-        st.error(f"❌ Error al cargar desde URL: {str(e)}")
-        st.info("💡 Verifica que el link sea público y termine en .xlsx")
-        return None
+        return None, f"Error al procesar Excel: {str(e)}"
 
 # Función para clasificar tipo de error
 def clasificar_tipo_error(texto):
@@ -89,58 +96,32 @@ def clasificar_tipo_error(texto):
     
     texto = str(texto).lower()
     
-    if any(palabra in texto for palabra in ['defecto', 'roto', 'dañado', 'calidad', 'malo', 'deteriorado', 'defectuoso', 'falla']):
+    if any(palabra in texto for palabra in ['defecto', 'roto', 'dañado', 'calidad', 'malo']):
         return "Calidad"
-    elif any(palabra in texto for palabra in ['color', 'tono', 'tonalidad']):
+    elif any(palabra in texto for palabra in ['color', 'tono']):
         return "Colores"
-    elif any(palabra in texto for palabra in ['equivocado', 'error', 'incorrecto', 'otro producto', 'diferente', 'no es']):
+    elif any(palabra in texto for palabra in ['equivocado', 'error', 'incorrecto']):
         return "Pedido Equivocado"
-    elif any(palabra in texto for palabra in ['talla', 'tamaño', 'medida', 'grande', 'pequeño', 'chico']):
+    elif any(palabra in texto for palabra in ['talla', 'tamaño']):
         return "Talla/Tamaño"
-    elif any(palabra in texto for palabra in ['entrega', 'demora', 'retraso', 'no llegó', 'tarde', 'envío']):
+    elif any(palabra in texto for palabra in ['entrega', 'demora', 'retraso']):
         return "Entrega"
     else:
         return "Otros"
 
 # Función para clasificar estado
-def clasificar_estado(texto_estado, texto_respuesta):
-    if pd.isna(texto_estado) and pd.isna(texto_respuesta):
+def clasificar_estado(respuesta):
+    if pd.isna(respuesta):
         return "Pendiente"
     
-    texto_completo = f"{str(texto_estado)} {str(texto_respuesta)}".lower()
+    texto = str(respuesta).lower()
     
-    if any(palabra in texto_completo for palabra in ['resuelto', 'solucionado', 'cerrado', 'completado', 'finalizado', 'atendido']):
+    if any(palabra in texto for palabra in ['resuelto', 'solucionado', 'cerrado']):
         return "Resuelto"
-    elif any(palabra in texto_completo for palabra in ['proceso', 'gestionando', 'revisando', 'en curso', 'trabajando', 'evaluando']):
+    elif any(palabra in texto for palabra in ['proceso', 'gestionando', 'revisando']):
         return "En Proceso"
     else:
         return "Pendiente"
-
-# Función para calcular satisfacción
-def calcular_satisfaccion(texto, es_inicial=True):
-    if pd.isna(texto):
-        return np.random.randint(2, 4) if es_inicial else None
-    
-    texto = str(texto).lower()
-    
-    palabras_negativas = ['malo', 'pésimo', 'terrible', 'horrible', 'decepción', 'molesto', 'enojado', 'frustrado', 'insatisfecho']
-    palabras_positivas = ['excelente', 'bueno', 'satisfecho', 'gracias', 'perfecto', 'contento', 'genial', 'feliz']
-    
-    score_negativo = sum(1 for palabra in palabras_negativas if palabra in texto)
-    score_positivo = sum(1 for palabra in palabras_positivas if palabra in texto)
-    
-    if es_inicial:
-        if score_negativo > score_positivo:
-            return np.random.randint(1, 3)
-        else:
-            return np.random.randint(2, 4)
-    else:
-        if score_positivo > score_negativo:
-            return np.random.randint(4, 6)
-        elif score_positivo == score_negativo:
-            return np.random.randint(3, 5)
-        else:
-            return np.random.randint(2, 4)
 
 # Título principal
 col1, col2 = st.columns([3, 1])
@@ -155,203 +136,131 @@ with col2:
 
 st.markdown("---")
 
-# Sidebar para configuración
+# Sidebar
 st.sidebar.header("⚙️ Configuración")
 
-# Opción de carga de archivo
+# Opción de carga
 opcion_carga = st.sidebar.radio(
     "Método de carga:",
-    ["Subir archivo Excel", "URL de OneDrive/Google Sheets", "Datos de ejemplo"]
+    ["Subir archivo Excel", "URL de SharePoint/OneDrive", "Datos de ejemplo"]
 )
 
 df = None
-motor_usado = None
 
 if opcion_carga == "Subir archivo Excel":
-    st.sidebar.info("📁 Arrastra tu archivo o usa 'Browse files'")
-    archivo = st.sidebar.file_uploader("Cargar archivo Excel", type=['xlsx', 'xls'])
+    st.sidebar.info("📁 Arrastra tu archivo Excel aquí")
+    archivo = st.sidebar.file_uploader("Cargar archivo", type=['xlsx', 'xls'])
     
     if archivo:
         with st.spinner("📂 Cargando archivo..."):
-            df, motor_usado = cargar_datos_excel(archivo)
+            df, error = cargar_datos_excel(archivo)
             if df is not None:
-                st.sidebar.success(f"✅ Archivo cargado correctamente (motor: {motor_usado})")
-                st.sidebar.info(f"📊 {len(df)} filas encontradas")
+                st.sidebar.success(f"✅ {len(df)} registros cargados")
+            else:
+                st.sidebar.error(f"❌ Error: {error}")
 
-elif opcion_carga == "URL de OneDrive/Google Sheets":
-    st.sidebar.info("💡 El link debe ser público y terminar en .xlsx")
-    url = st.sidebar.text_input("Ingresa la URL del archivo:")
+elif opcion_carga == "URL de SharePoint/OneDrive":
+    st.sidebar.info("💡 Pega el link compartido de SharePoint/OneDrive")
+    url = st.sidebar.text_input("URL del archivo:")
     
     if url and st.sidebar.button("🔄 Cargar desde URL"):
         with st.spinner("🌐 Descargando desde la nube..."):
-            df = cargar_desde_url(url)
+            df, error = cargar_desde_url(url)
             if df is not None:
-                st.sidebar.success("✅ Datos cargados desde URL")
-                st.sidebar.info(f"📊 {len(df)} filas encontradas")
-        
+                st.sidebar.success(f"✅ {len(df)} registros cargados")
+            else:
+                st.sidebar.error(f"❌ {error}")
+
 else:  # Datos de ejemplo
-    st.sidebar.info("📝 Usando datos de ejemplo")
-    fechas = pd.date_range(end=datetime.now(), periods=50, freq='D')
-    productos = ['Guantes de Seguridad', 'Casco Industrial', 'Zapatos de Seguridad', 
-                 'Chaleco Reflectivo', 'Mascarilla N95', 'Botas de Seguridad', 
-                 'Arnés de Seguridad', 'Lentes de Protección']
-    
-    quejas_ejemplo = [
-        'Producto llegó defectuoso', 'Color incorrecto en el pedido', 
-        'Talla equivocada', 'Entrega con mucho retraso', 
-        'Calidad muy baja del material'
-    ]
+    fechas = pd.date_range(end=datetime.now(), periods=30, freq='D')
+    productos = ['Guantes', 'Casco', 'Zapatos', 'Chaleco', 'Mascarilla']
     
     df = pd.DataFrame({
-        'fecha': np.random.choice(fechas, 50),
-        'producto': np.random.choice(productos, 50),
-        'descripcion_queja': np.random.choice(quejas_ejemplo, 50),
-        'respuesta': [f"Hemos solucionado su problema enviando reemplazo" if np.random.random() > 0.3 else None for i in range(50)],
-        'estado': np.random.choice(['Resuelto', 'En Proceso', 'Pendiente'], 50, p=[0.5, 0.3, 0.2]),
+        'fecha': pd.to_datetime([fechas[i % len(fechas)] for i in range(30)]),
+        'producto': [productos[i % len(productos)] for i in range(30)],
+        'queja': ['Producto defectuoso'] * 10 + ['Color incorrecto'] * 10 + ['Talla equivocada'] * 10,
+        'respuesta': ['Solucionado'] * 15 + [None] * 15
     })
+    st.sidebar.info("📝 Usando datos de ejemplo")
 
-# Procesar datos si existen
+# Procesar datos
 if df is not None and len(df) > 0:
     
-    # Mostrar vista previa del archivo
-    with st.expander("👀 Vista previa de datos cargados"):
-        st.write(f"**Total de registros:** {len(df)}")
-        st.write(f"**Columnas encontradas:** {', '.join(df.columns.tolist())}")
-        st.dataframe(df.head(10), use_container_width=True)
+    # Vista previa
+    with st.expander("👀 Vista previa de datos"):
+        st.write(f"**Registros:** {len(df)}")
+        st.write(f"**Columnas:** {', '.join(df.columns)}")
+        st.dataframe(df.head(5))
     
-    # Limpiar nombres de columnas
+    # Limpiar columnas
     df.columns = df.columns.str.strip().str.lower()
+    cols = df.columns.tolist()
     
-    # Detectar columnas automáticamente
-    columnas_disponibles = df.columns.tolist()
-    
+    # Mapeo de columnas
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🔍 Mapeo de Columnas")
+    st.sidebar.subheader("🔍 Columnas")
     
-    # Buscar o permitir seleccionar columnas
-    col_fecha = st.sidebar.selectbox(
-        "Columna de Fecha:",
-        options=columnas_disponibles,
-        index=next((i for i, col in enumerate(columnas_disponibles) if 'fecha' in col), 0)
-    )
+    col_fecha = st.sidebar.selectbox("Fecha:", cols, index=0)
+    col_producto = st.sidebar.selectbox("Producto:", ['Sin especificar'] + cols)
+    col_queja = st.sidebar.selectbox("Queja:", cols, index=min(1, len(cols)-1))
+    col_respuesta = st.sidebar.selectbox("Respuesta:", ['Ninguna'] + cols)
     
-    col_producto = st.sidebar.selectbox(
-        "Columna de Producto:",
-        options=['[Sin producto]'] + columnas_disponibles,
-        index=next((i+1 for i, col in enumerate(columnas_disponibles) if 'producto' in col or 'item' in col), 0)
-    )
+    # Crear DataFrame procesado
+    df_proc = pd.DataFrame()
+    df_proc['fecha'] = pd.to_datetime(df[col_fecha], errors='coerce')
+    df_proc['producto'] = df[col_producto] if col_producto != 'Sin especificar' else 'Sin especificar'
+    df_proc['queja'] = df[col_queja].astype(str)
+    df_proc['respuesta'] = df[col_respuesta] if col_respuesta != 'Ninguna' else None
     
-    col_queja = st.sidebar.selectbox(
-        "Columna de Queja/Reclamo:",
-        options=columnas_disponibles,
-        index=next((i for i, col in enumerate(columnas_disponibles) if any(palabra in col for palabra in ['queja', 'reclamo', 'descripcion', 'problema', 'asunto'])), 0)
-    )
-    
-    col_respuesta = st.sidebar.selectbox(
-        "Columna de Respuesta:",
-        options=['[Sin respuesta]'] + columnas_disponibles,
-        index=next((i+1 for i, col in enumerate(columnas_disponibles) if 'respuesta' in col or 'solucion' in col), 0)
-    )
-    
-    col_estado = st.sidebar.selectbox(
-        "Columna de Estado:",
-        options=['[Auto-clasificar]'] + columnas_disponibles,
-        index=0
-    )
-    
-    # Crear DataFrame de trabajo
-    df_trabajo = pd.DataFrame()
-    df_trabajo['fecha'] = pd.to_datetime(df[col_fecha], errors='coerce')
-    df_trabajo['producto'] = df[col_producto] if col_producto != '[Sin producto]' else 'Sin especificar'
-    df_trabajo['descripcion_queja'] = df[col_queja].astype(str)
-    df_trabajo['respuesta'] = df[col_respuesta] if col_respuesta != '[Sin respuesta]' else None
-    
-    # Clasificaciones automáticas
-    df_trabajo['tipo_error'] = df_trabajo['descripcion_queja'].apply(clasificar_tipo_error)
-    
-    if col_estado != '[Auto-clasificar]':
-        df_trabajo['estado'] = df[col_estado]
-    else:
-        df_trabajo['estado'] = df_trabajo.apply(
-            lambda x: clasificar_estado(None, x['respuesta']), axis=1
-        )
-    
-    df_trabajo['satisfaccion_inicial'] = df_trabajo['descripcion_queja'].apply(
-        lambda x: calcular_satisfaccion(x, es_inicial=True)
-    )
-    
-    df_trabajo['satisfaccion_final'] = df_trabajo.apply(
-        lambda x: calcular_satisfaccion(x['respuesta'], es_inicial=False) 
-        if x['estado'] == 'Resuelto' else None, 
-        axis=1
-    )
-    
-    df_trabajo['dias_resolucion'] = df_trabajo.apply(
-        lambda x: np.random.randint(1, 10) if x['estado'] == 'Resuelto' else None,
-        axis=1
-    )
+    # Clasificaciones
+    df_proc['tipo_error'] = df_proc['queja'].apply(clasificar_tipo_error)
+    df_proc['estado'] = df_proc['respuesta'].apply(clasificar_estado)
     
     # Filtros
     st.sidebar.markdown("---")
-    st.sidebar.header("🔍 Filtros")
+    st.sidebar.subheader("📅 Filtros de Fecha")
     
-    fecha_min = df_trabajo['fecha'].min()
-    fecha_max = df_trabajo['fecha'].max()
+    # Filtrar filas con fechas válidas
+    df_proc_con_fecha = df_proc[df_proc['fecha'].notna()].copy()
     
-    if pd.notna(fecha_min) and pd.notna(fecha_max):
-        fecha_inicio = st.sidebar.date_input("Fecha inicio", value=fecha_min.date())
-        fecha_fin = st.sidebar.date_input("Fecha fin", value=fecha_max.date())
+    if len(df_proc_con_fecha) > 0:
+        fecha_min = df_proc_con_fecha['fecha'].min()
+        fecha_max = df_proc_con_fecha['fecha'].max()
+        
+        try:
+            fecha_inicio = st.sidebar.date_input("Desde:", fecha_min.date())
+            fecha_fin = st.sidebar.date_input("Hasta:", fecha_max.date())
+            
+            # Aplicar filtro
+            mask = (df_proc['fecha'].dt.date >= fecha_inicio) & (df_proc['fecha'].dt.date <= fecha_fin)
+            df_filtrado = df_proc[mask]
+        except:
+            # Si hay error en las fechas, mostrar todos los datos
+            df_filtrado = df_proc
+            st.sidebar.warning("⚠️ Algunas fechas no son válidas")
     else:
-        fecha_inicio = datetime.now().date() - timedelta(days=30)
-        fecha_fin = datetime.now().date()
+        # Si no hay fechas válidas, mostrar todos los datos
+        df_filtrado = df_proc
+        st.sidebar.warning("⚠️ No se encontraron fechas válidas")
     
-    tipo_error_filtro = st.sidebar.multiselect(
-        "Tipo de Error:",
-        options=sorted(df_trabajo['tipo_error'].unique()),
-        default=df_trabajo['tipo_error'].unique()
-    )
-    
-    estado_filtro = st.sidebar.multiselect(
-        "Estado:",
-        options=sorted(df_trabajo['estado'].unique()),
-        default=df_trabajo['estado'].unique()
-    )
-    
-    # Aplicar filtros
-    mask = (
-        (df_trabajo['fecha'].dt.date >= fecha_inicio) &
-        (df_trabajo['fecha'].dt.date <= fecha_fin) &
-        (df_trabajo['tipo_error'].isin(tipo_error_filtro)) &
-        (df_trabajo['estado'].isin(estado_filtro))
-    )
-    df_filtrado = df_trabajo[mask].copy()
-    
-    # Métricas principales
+    # Métricas
     st.header("📈 Métricas Principales")
     
     col1, col2, col3, col4 = st.columns(4)
     
-    total_quejas = len(df_filtrado)
-    quejas_resueltas = len(df_filtrado[df_filtrado['estado'] == 'Resuelto'])
-    tasa_resolucion = (quejas_resueltas / total_quejas * 100) if total_quejas > 0 else 0
-    
-    tiempo_promedio = df_filtrado[df_filtrado['dias_resolucion'].notna()]['dias_resolucion'].mean()
-    tiempo_promedio = tiempo_promedio if not pd.isna(tiempo_promedio) else 0
-    
-    satisfaccion_inicial = df_filtrado['satisfaccion_inicial'].mean()
-    satisfaccion_final = df_filtrado[df_filtrado['satisfaccion_final'].notna()]['satisfaccion_final'].mean()
-    mejora_satisfaccion = satisfaccion_final - satisfaccion_inicial if not pd.isna(satisfaccion_final) else 0
+    total = len(df_filtrado)
+    resueltos = len(df_filtrado[df_filtrado['estado'] == 'Resuelto'])
+    tasa = (resueltos / total * 100) if total > 0 else 0
     
     with col1:
-        st.metric("Total de Quejas", total_quejas)
+        st.metric("Total Quejas", total)
     with col2:
-        st.metric("Tasa de Resolución", f"{tasa_resolucion:.1f}%", 
-                  delta=f"{quejas_resueltas} resueltas")
+        st.metric("Resueltas", resueltos)
     with col3:
-        st.metric("Tiempo Promedio", f"{tiempo_promedio:.1f} días")
+        st.metric("Tasa Resolución", f"{tasa:.1f}%")
     with col4:
-        st.metric("Mejora Satisfacción", f"+{mejora_satisfaccion:.1f}", 
-                  delta=f"{satisfaccion_inicial:.1f} → {satisfaccion_final:.1f}")
+        pendientes = total - resueltos
+        st.metric("Pendientes", pendientes)
     
     st.markdown("---")
     
@@ -359,93 +268,41 @@ if df is not None and len(df) > 0:
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("📊 Quejas por Tipo de Error")
-        tipo_error_counts = df_filtrado['tipo_error'].value_counts()
-        st.bar_chart(tipo_error_counts)
+        st.subheader("📊 Por Tipo de Error")
+        tipo_counts = df_filtrado['tipo_error'].value_counts()
+        st.bar_chart(tipo_counts)
     
     with col2:
-        st.subheader("📈 Quejas por Estado")
+        st.subheader("📈 Por Estado")
         estado_counts = df_filtrado['estado'].value_counts()
         st.bar_chart(estado_counts)
     
-    col3, col4 = st.columns(2)
-    
-    with col3:
-        st.subheader("🏆 Top 5 Productos con Quejas")
-        producto_counts = df_filtrado['producto'].value_counts().head(5)
-        st.bar_chart(producto_counts)
-    
-    with col4:
-        st.subheader("⭐ Satisfacción Promedio")
-        comparacion_data = pd.DataFrame({
-            'Antes': [satisfaccion_inicial],
-            'Después': [satisfaccion_final if not pd.isna(satisfaccion_final) else 0]
-        })
-        st.bar_chart(comparacion_data)
-    
-    # Tendencias temporales
-    st.subheader("📅 Tendencias Temporales")
-    df_temporal = df_filtrado.groupby(df_filtrado['fecha'].dt.date).size()
-    st.line_chart(df_temporal)
-    
-    # Tabla detallada
+    # Tabla
     st.markdown("---")
     st.subheader("📋 Detalle de Quejas")
     
-    df_mostrar = df_filtrado[['fecha', 'producto', 'tipo_error', 'estado', 
-                               'satisfaccion_inicial', 'satisfaccion_final', 'dias_resolucion']].copy()
-    df_mostrar['fecha'] = df_mostrar['fecha'].dt.strftime('%Y-%m-%d')
+    # Preparar datos para mostrar
+    df_mostrar = df_filtrado[['fecha', 'producto', 'tipo_error', 'estado']].copy()
+    
+    # Convertir fecha a string de forma segura
+    df_mostrar['fecha'] = df_mostrar['fecha'].apply(
+        lambda x: x.strftime('%Y-%m-%d') if pd.notna(x) else 'Sin fecha'
+    )
     
     st.dataframe(df_mostrar, use_container_width=True, height=400)
     
     # Exportar
     st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        csv = df_filtrado.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Descargar CSV",
-            data=csv,
-            file_name=f"quejas_segpro_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
-        )
+    csv = df_filtrado.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        "📥 Descargar CSV",
+        data=csv,
+        file_name=f"quejas_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv"
+    )
 
 else:
-    st.info("👆 Por favor, carga un archivo en el menú lateral")
-    
-    st.markdown("""
-    ### 📝 Guía Rápida:
-    
-    #### 🔧 **Si ves error al cargar Excel:**
-    ```bash
-    pip install --upgrade openpyxl xlrd pandas
-    ```
-    
-    #### 📁 **Para subir archivo:**
-    1. Haz click en "Browse files"
-    2. Selecciona tu `Reclamos_SEGPRO.xlsx`
-    3. El dashboard lo procesará automáticamente
-    
-    #### 🔗 **Para usar URL de OneDrive:**
-    1. Abre el archivo en OneDrive
-    2. Click en "Compartir" → "Cualquiera con el vínculo"
-    3. Copia y pega el link
-    4. Click en "Cargar desde URL"
-    
-    #### ✅ **El dashboard necesita mínimo una columna con:**
-    - Fechas
-    - Descripción de la queja
-    
-    Todo lo demás se clasifica automáticamente! 🎉
-    """)
+    st.info("👈 Carga un archivo Excel en el menú lateral")
 
 st.markdown("---")
-st.markdown(
-    """
-    <div style='text-align: center; color: gray; font-size: 12px;'>
-        Dashboard SEGPRO | © 2024 | v2.0
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+st.markdown("<div style='text-align: center; color: gray;'>Dashboard SEGPRO © 2024</div>", unsafe_allow_html=True)
