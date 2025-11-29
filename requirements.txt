@@ -1,0 +1,13 @@
+streamlit
+pandas
+openpyxl
+xlrd
+requests
+numpy
+```
+
+### **2. Estructura de tu proyecto en GitHub:**
+```
+tu-repositorio/
+├── dashboard_segpro.py
+└── requirements.txt
